@@ -1,0 +1,36 @@
+rules:
+  - id: jwt-verify-missing-algorithms
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >
+      jwt.verify() is called without an explicit `algorithms` allowlist. The
+      library then accepts whatever algorithm the token's header claims, which
+      enables algorithm-confusion attacks: an RS256 verifier can be tricked into
+      treating the public key as an HS256 secret, and some setups accept
+      `alg: none` (unsigned tokens). Always pass e.g. { algorithms: ['RS256'] }.
+    metadata:
+      category: security
+      cwe: "CWE-347: Improper Verification of Cryptographic Signature"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: MEDIUM
+    patterns:
+      - pattern: "$JWT.verify($TOKEN, $KEY)"
+      - metavariable-regex:
+          metavariable: $JWT
+          regex: (jwt|jsonwebtoken)
+
+  - id: jwt-algorithm-none-allowed
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >
+      A JWT verification path explicitly allows the `none` algorithm (unsigned
+      tokens). Any attacker can then forge a token with `alg: none` and no
+      signature. Remove 'none' from the algorithms list.
+    metadata:
+      category: security
+      cwe: "CWE-347: Improper Verification of Cryptographic Signature"
+      owasp: "A02:2021 - Cryptographic Failures"
+      confidence: HIGH
+    pattern-either:
+      - pattern: '$JWT.verify(..., { ..., algorithms: [..., "none", ...], ... })'
+      - pattern: '$JWT.verify(..., { ..., algorithms: [..., "None", ...], ... })'

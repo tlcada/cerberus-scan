@@ -1,0 +1,51 @@
+rules:
+  - id: authz-owner-id-from-request-body
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >
+      A database query is scoped to an owner id (UserId/OwnerId/AccountId/...)
+      taken from the request body or query, not from the authenticated session.
+      An attacker just sends someone else's id and reads/writes their rows -
+      Broken Object-Level Authorization (IDOR/BOLA). Derive the owner id from the
+      verified JWT/session (e.g. authenticatedUser.data.id), never from client
+      input, and reject a body/query-supplied owner id.
+    metadata:
+      category: security
+      cwe: "CWE-639: Authorization Bypass Through User-Controlled Key"
+      owasp: "A01:2021 - Broken Access Control"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: "{ where: { ..., $OWNER: $REQ.body.$F, ... } }"
+          - pattern: "{ where: { ..., $OWNER: $REQ.query.$F, ... } }"
+      - metavariable-regex:
+          metavariable: $OWNER
+          regex: (?i)^(user|owner|account|customer|tenant|org|seller|buyer)_?id$
+      - metavariable-regex:
+          metavariable: $REQ
+          regex: ^(req|request)$
+
+  - id: trust-sensitive-field-from-request-body
+    languages: [typescript, javascript]
+    severity: WARNING
+    message: >
+      A trust-sensitive field (author/role/isAdmin/owner/verified/price) is set
+      directly from the request body when creating/inserting a record. A client
+      can then forge that value - e.g. post a review as another author, or grant
+      itself a role. Set these server-side from the authenticated identity or a
+      fixed value; never copy them from client input.
+    metadata:
+      category: security
+      cwe: "CWE-915: Improperly Controlled Modification of Object Attributes"
+      owasp: "A01:2021 - Broken Access Control"
+      confidence: LOW
+    patterns:
+      - pattern-either:
+          - pattern: "$COL.insert({ ..., $FIELD: $REQ.body.$F, ... })"
+          - pattern: "$COL.create({ ..., $FIELD: $REQ.body.$F, ... })"
+      - metavariable-regex:
+          metavariable: $FIELD
+          regex: (?i)^(author|role|isadmin|is_admin|owner|userid|user_id|verified|price|amount|total|discount)$
+      - metavariable-regex:
+          metavariable: $REQ
+          regex: ^(req|request)$

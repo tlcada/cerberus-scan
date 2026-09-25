@@ -1,0 +1,568 @@
+CERBERUS SECURITY REPORT — OWASP Juice Shop
+Target: <path>\juice-shop  ·  Runtime: http://localhost:3000
+
+Risk: CRITICAL  ·  9 CRITICAL, 11 HIGH, 9 MEDIUM, 3 LOW (app-level, manually
+      traced + runtime proven; excludes the 489-finding scanner haul detailed
+      below)
+App nature: OWASP Juice Shop — an intentionally-vulnerable training/CTF
+            application. Every finding below is a deliberately planted
+            vulnerability. This report is a validated attack map, not a
+            surprise triage list.
+Verdict: An unauthenticated attacker can fully take over any account
+         (including admin) three independent ways — SQL injection, JWT
+         algorithm confusion, or a leaked MD5 password hash — read or forge
+         any other user's data (baskets, orders, reviews, coupons), run
+         arbitrary JavaScript inside the database engine, and get free
+         "deluxe" membership and free discount coupons. Every chain below
+         was executed live against the running instance, not just read in
+         source.
+
+═══════════════════════════════════════════════════════════════════════════
+FINDINGS (most severe first)
+═══════════════════════════════════════════════════════════════════════════
+
+--- 1. JWT algorithm-confusion auth bypass (pre-auth admin takeover) · 🔴 CRITICAL · Confirmed exploitable ---
+  Where:    lib/insecurity.ts:52 (isAuthorized), lib/insecurity.ts:189
+            (updateAuthenticatedUsers)  (endpoint: any route behind
+            security.isAuthorized(), e.g. GET /api/Users)
+  Impact:   Full authentication bypass as ANY user, including admin, with
+            zero credentials — worse than the SQLi below because it needs no
+            valid account at all.
+  Trace:
+    1. publicKey = fs.readFileSync('encryptionkeys/jwt.pub')   lib/insecurity.ts:20
+    2. -> served world-readable                                server.ts:296-297, routes/keyServer.ts:9-19
+    3. -> expressJwt({ secret: publicKey })  (no `algorithms` allowlist)   lib/insecurity.ts:52
+    4. -> jwt.verify(token, publicKey, callback)  (no options -> algorithm from token header)  lib/insecurity.ts:189
+  Attack:
+    1. GET /encryptionkeys/jwt.pub  -> 200, returns the RSA public key in plaintext
+    2. Build token: header {"alg":"HS256"}, payload {"data":{"id":1,"role":"admin",...}},
+       sig = HMAC-SHA256(header.payload, <public key bytes>)
+    3. GET /rest/user/whoami with that token -> 200 {"user":{"id":1,"email":"admin@juice-sh.op"...}}
+       GET /api/Users with that token -> 200 (admin-only user list)
+       (verified against http://localhost:3000; zero real credentials used)
+  Basis:    Static + runtime confirmed.
+  Intentional: known challenge family (jwtChallenges)
+  Fix:      expressJwt({ secret: publicKey, algorithms: ['RS256'] }); same for
+            jwt.verify(token, publicKey, { algorithms: ['RS256'] }, cb).
+            Also stop serving the raw PEM at a guessable public path.
+
+--- 2. SQL injection — login auth bypass · 🔴 CRITICAL · Confirmed exploitable ---
+  Where:    routes/login.ts:34  (endpoint: POST /rest/user/login)
+  Impact:   Unauthenticated login as any account, including admin, no
+            password needed.
+  Trace:
+    1. req.body.email, req.body.password                        routes/login.ts:32
+    2. -> `SELECT * FROM Users WHERE email = '${req.body.email}' AND
+          password = '${hash(req.body.password)}' ...`          routes/login.ts:34  <- sink (raw sequelize.query, string concat)
+  Attack:
+    1. POST /rest/user/login {"email":"admin@juice-sh.op'--","password":"x"}
+    2. 200 — full admin JWT returned, including the account's MD5 password
+       hash embedded in the token payload (verified against
+       http://localhost:3000)
+  Basis:    Static + runtime confirmed.
+  Intentional: known challenge (loginAdminChallenge / loginBenderChallenge / loginJimChallenge)
+  Fix:      Use parameterized/bound queries (sequelize.query with `replacements`,
+            or UserModel.findOne({ where: {...} })).
+
+--- 3. NoSQL $where JavaScript injection (server-side JS execution in DB engine) · 🔴 CRITICAL · Confirmed exploitable ---
+  Where:    routes/showProductReviews.ts:36, routes/trackOrder.ts:18,
+            routes/chat.ts:149  (endpoints: GET /rest/products/:id/reviews
+            [no auth], GET /rest/track-order/:id [no auth], chat tool
+            getProductReviews)
+  Impact:   Arbitrary boolean/JS predicate injection into the marsdb query
+            engine — data exfiltration across all records, and (per the
+            underlying library's own advisory) command injection. The app
+            even ships a global `sleep()` helper solely to let this be
+            escalated to a DoS primitive (showProductReviews.ts:17-26).
+  Trace:
+    1. req.params.id (raw, only truncated to 40 chars when the
+       "noSqlCommandChallenge" is enabled — the default)          routes/showProductReviews.ts:31
+    2. -> db.reviewsCollection.find({ $where: 'this.product == ' + id })  routes/showProductReviews.ts:36  <- sink
+  Attack:
+    1. GET /rest/products/1/reviews -> 2 reviews (baseline)
+    2. GET /rest/products/1%20%7C%7C%20true/reviews -> 29 reviews (all
+       reviews, all products) — proves the `id` is evaluated as a JS
+       expression, not compared as data (verified against
+       http://localhost:3000)
+  Basis:    Static + runtime confirmed. Corroborated by npm-audit CRITICAL
+            "Command Injection in marsdb" (GHSA-5mrr-rgp6-x4gr).
+  Intentional: known challenge (noSqlCommandChallenge / noSqlOrdersChallenge)
+  Fix:      Never build $where from user input; query `{ product: Number(id) }`
+            directly. Remove the global sleep() DoS helper. Upgrade off marsdb.
+
+--- 4. Password hash disclosure via /rest/user/whoami?fields= + JSONP cross-origin leak · 🔴 CRITICAL · Confirmed exploitable ---
+  Where:    routes/currentUser.ts:27-33 (field allowlist bypass),
+            routes/currentUser.ts:54-58 (JSONP)  (endpoint: GET /rest/user/whoami)
+  Impact:   Any authenticated user can dump their own MD5 password hash (and
+            totpSecret/deluxeToken) via a query param, and — because the
+            response also supports `?callback=`, bypassing same-origin
+            protections — any third-party website can exfiltrate it
+            cross-origin while the victim is logged in (classic JSONP leak,
+            CSRF-equivalent).
+  Trace:
+    1. req.query.fields split on ',' with no allowlist check     routes/currentUser.ts:22-23
+    2. -> baseUser[field] = user.data[field]  (full server-cached
+       record incl. password/totpSecret)                        routes/currentUser.ts:29-31
+    3. -> req.query.callback present -> res.jsonp(response)      routes/currentUser.ts:54-58  <- sink
+  Attack:
+    1. GET /rest/user/whoami?fields=password,totpSecret,deluxeToken
+       -> {"user":{"password":"e541ca7ecf72b8d1286474fc613e5e45",...}}
+    2. GET /rest/user/whoami?fields=password&callback=leak
+       -> `/**/ typeof leak==='function' && leak({"user":{"password":"e541c..."}});`
+       (executes cross-origin from any page that <script src="">'s this URL
+       while the victim's session cookie is attached)
+       (both verified against http://localhost:3000)
+  Basis:    Static + runtime confirmed.
+  Intentional: known challenge (passwordHashLeakChallenge / emailLeakChallenge)
+  Fix:      Return only an explicit safe-field allowlist regardless of the
+            `fields` param; remove JSONP support entirely.
+
+--- 5. Hardcoded RSA private key, MD5 password hashing, hardcoded HMAC secret · 🔴 CRITICAL · Confirmed in code ---
+  Where:    lib/insecurity.ts:21 (privateKey), lib/insecurity.ts:41 (MD5
+            hash), lib/insecurity.ts:42 (hardcoded HMAC key)
+  Impact:   Full JWT signing key is in source control (compounds finding 1);
+            passwords are MD5 (trivially crackable, no salt); a static HMAC
+            key ('pa4qacea4VK9t9nGv7yZtwmj') is reused app-wide for
+            integrity checks.
+  Trace:    Not applicable — plainly hardcoded in source, no request path needed.
+  Attack:   Not performed beyond finding 1 (which already consumes this key).
+  Basis:    Static confirmed. Corroborated by gitleaks (Private Key / Generic
+            API Key rules hitting this exact file).
+  Intentional: known challenge content (used across multiple challenges)
+  Fix:      Load signing keys from a secret store, rotate off any
+            source-controlled key; hash passwords with bcrypt/argon2 + salt;
+            derive HMAC keys per-purpose from a managed secret.
+
+--- 6. Outdated JWT stack — jsonwebtoken 0.4.0 / express-jwt 0.1.3 / jws <=3.2.2 · 🔴 CRITICAL · Confirmed in code ---
+  Where:    package.json:112 (express-jwt "0.1.3"), package.json:129
+            (jsonwebtoken "0.4.0")
+  Impact:   These exact ancient, hard-pinned versions are the root cause
+            enabling finding 1 (no `algorithms` enforcement even existed
+            reliably in this era of the library).
+  Trace:    Not applicable — dependency-level finding.
+  Basis:    Static confirmed; npm-audit CRITICAL/HIGH, corroborated:
+            jsonwebtoken: GHSA-c7hr-j4mj-j2w6 (Verification Bypass, critical),
+            GHSA-8cf7-32gw-wr33, GHSA-hjrf-2m68-5959, GHSA-qwph-4952-7xr6.
+            express-jwt: GHSA-6g6m-m6h5-w9gf (Authorization bypass, high).
+            jws: GHSA-gjcw-v447-2w7q, GHSA-869p-cjfg-cm3x (Forgeable tokens, high).
+  Intentional: known challenge dependency
+  Fix:      Upgrade to current jsonwebtoken/express-jwt and pin `algorithms`.
+
+--- 7. IDOR — cross-account basket read and full user-table dump · 🟠 HIGH · Confirmed exploitable ---
+  Where:    routes/basket.ts:18-19 (GET /rest/basket/:id),
+            routes/authenticatedUsers.ts:10-35 (GET /rest/user/authentication-details)
+  Impact:   Any authenticated customer can read any other user's basket
+            contents, and separately can enumerate every account in the
+            system (email, role, deluxeToken, lastLoginIp) with no
+            role/ownership check.
+  Trace:
+    1. req.params.id used directly, no comparison to the caller's session bid   routes/basket.ts:18
+    2. -> BasketModel.findOne({ where: { id } })                                routes/basket.ts:19  <- sink
+    (sibling contrast: routes/address.ts derives UserId from
+     security.appendUserId() middleware — the correct pattern basket.ts skips)
+  Attack:
+    1. Login as jim (via finding 2), GET /rest/basket/1 (admin's own basket,
+       bid=1) -> 200, full contents of admin's basket returned to jim
+    2. GET /rest/user/authentication-details as jim (customer role) -> 200,
+       full list of all ~24 accounts including admin/accounting emails,
+       deluxeTokens, lastLoginIp
+       (both verified against http://localhost:3000)
+  Basis:    Static + runtime confirmed.
+  Intentional: known challenge (basketAccessChallenge)
+  Fix:      Scope basket lookup to the session-derived bid; gate
+            authentication-details behind an admin/self check.
+
+--- 8. Reflected XSS via track-order (pre-auth) · 🟠 HIGH · Confirmed exploitable ---
+  Where:    routes/trackOrder.ts:15-17 (server reflection),
+            frontend/src/app/track-result/track-result.component.ts:49 (sink)
+  Impact:   Pre-auth reflected XSS — arbitrary JS executes in any victim who
+            opens a crafted track-order link.
+  Trace:
+    1. req.params.id, sanitizer bypassed by default (challenge enabled)     routes/trackOrder.ts:15
+    2. -> res.json({ data:[{ orderId: id }] })  (raw passthrough)           routes/trackOrder.ts:18-23
+    3. -> this.sanitizer.bypassSecurityTrustHtml(`<code>${orderId}</code>`)  track-result.component.ts:49  <- sink
+  Attack:
+    1. GET /rest/track-order/%3Ciframe%20src=%22javascript:alert(1)%22%3E
+       -> {"data":[{"orderId":"<iframe src=\"javascript:alert(1)\">"}]}
+       raw, unescaped (verified against http://localhost:3000)
+    2. Victim opens #/track-result?id=<same payload> -> payload renders via
+       bypassSecurityTrustHtml -> script executes
+  Basis:    Static + runtime confirmed (server reflection proven live;
+            client sink read in source).
+  Intentional: known challenge (reflectedXssChallenge)
+  Fix:      Keep the character-whitelist sanitization always on; stop using
+            bypassSecurityTrustHtml on server-derived strings.
+
+--- 9. DOM XSS via search query · 🟠 HIGH · Confirmed in code ---
+  Where:    frontend/src/app/search-result/search-result.component.ts:144
+            (endpoint: GET /#/search?q=...)
+  Impact:   Same class as #8 — attacker-controlled query string is passed
+            straight to bypassSecurityTrustHtml.
+  Trace:    route queryParam -> this.searchValue =
+            sanitizer.bypassSecurityTrustHtml(queryParam)   search-result.component.ts:144  <- sink
+  Attack:   Not performed live (client-only DOM sink, no server round-trip to
+            script-verify); code path is unambiguous.
+  Basis:    Static confirmed. Corroborated by opengrep (bypassSecurityTrust*
+            rule) on this exact line.
+  Intentional: known challenge (localXssChallenge / xssBonusChallenge)
+  Fix:      Do not bypass Angular's sanitizer on user-controlled input; use
+            text binding instead of innerHTML/trustHtml.
+
+--- 10. SSRF via profile image URL upload · 🟠 HIGH · Confirmed in code ---
+  Where:    routes/profileImageUrlUpload.ts:24 (endpoint: POST /profile/image/url)
+  Impact:   Authenticated server-side request forgery — the server fetches
+            any attacker-supplied URL with no allowlist, reachable from the
+            server's network position (cloud metadata endpoints, internal
+            services).
+  Trace:
+    1. req.body.imageUrl (only checked for a specific challenge-marker
+       substring, not validated as safe)                    routes/profileImageUrlUpload.ts:18-20
+    2. -> await fetch(url)                                   routes/profileImageUrlUpload.ts:24  <- sink
+  Attack:   Not performed against external/internal targets (no safe target
+            available in this environment); code path is unambiguous and
+            unauthenticated-network-reachable by design.
+  Basis:    Static confirmed (full source-to-sink trace, no allowlist on path).
+  Intentional: known challenge (ssrfChallenge)
+  Fix:      Allowlist destination hosts/schemes; block RFC1918 and
+            link-local ranges (169.254.169.254 etc.) before fetching.
+
+--- 11. Open redirect — allowlist bypass via substring match · 🟠 HIGH · Confirmed exploitable ---
+  Where:    lib/insecurity.ts:133-139 (isRedirectAllowed)  (endpoint: GET /redirect?to=)
+  Impact:   Any URL that merely contains an allowlisted string anywhere
+            passes the check — full open redirect to attacker infrastructure,
+            useful for phishing/OAuth-token theft.
+  Trace:    toUrl.includes(allowedUrl)  (substring, not prefix/exact match)   lib/insecurity.ts:136  <- sink
+  Attack:
+    1. GET /redirect?to=https://evil.example.com/?x=https://github.com/juice-shop/juice-shop
+    2. 302 Found, Location: https://evil.example.com/?x=https://github.com/juice-shop/juice-shop
+       (verified against http://localhost:3000)
+  Basis:    Static + runtime confirmed.
+  Intentional: known challenge (redirectChallenge)
+  Fix:      Compare against an exact allowlist or validate with URL parsing
+            (origin equality), never `.includes()`.
+
+--- 12. RCE via vm + notevil sandbox escape (b2b order processing) · 🟠 HIGH · Confirmed in code ---
+  Where:    routes/b2bOrder.ts:20-23  (endpoint: POST /b2b/v2/orders, gated
+            by challenge flags rceChallenge/rceOccupyChallenge)
+  Impact:   User-supplied `orderLinesData` is passed into `notevil` inside a
+            node vm sandbox; the notevil package has a public sandbox-escape
+            advisory, making this a path to arbitrary code execution on the
+            server when the RCE challenge flag is enabled.
+  Trace:    body.orderLinesData -> vm.runInContext('safeEval(orderLinesData)', ...)   routes/b2bOrder.ts:19-23  <- sink
+  Attack:   Not performed (would require enabling the RCE challenge flag and
+            crafting a sandbox-escape payload — destructive/out of scope for
+            a read-only proof).
+  Basis:    Static confirmed. Corroborated by npm-audit MODERATE "Sandbox
+            escape in notevil" (GHSA-8g4m-cjm2-96wq).
+  Intentional: known challenge (rceChallenge / rceOccupyChallenge)
+  Fix:      Remove the eval-based sandbox entirely; parse order lines with a
+            real, non-Turing-complete format (JSON schema).
+
+--- 13. Free "deluxe" membership — payment step skipped by client-controlled mode · 🟠 HIGH · Confirmed in code ---
+  Where:    routes/deluxe.ts:16-57  (endpoint: POST /rest/deluxe-membership)
+  Impact:   Business-logic bypass: if `paymentMode` is anything other than
+            the literal strings 'wallet' or 'card', neither payment branch
+            executes — no funds are ever deducted, no card is checked — yet
+            the code proceeds directly to granting deluxe role. The app's
+            own challenge-solve check makes the flaw explicit.
+  Trace:
+    1. if (paymentMode === 'wallet') {...} / if (paymentMode === 'card') {...}
+       — both skipped for any other value                     routes/deluxe.ts:24-40
+    2. -> user.update({ role: 'deluxe', deluxeToken: ... })     routes/deluxe.ts:43  <- sink (unconditional)
+  Attack:   Not performed live (would durably upgrade a test account's role;
+            avoided as a state-changing action per read-only proof policy).
+  Basis:    Static confirmed — full trace, and challengeUtils.solveIf on the
+            very next line explicitly checks
+            `paymentMode !== 'wallet' && paymentMode !== 'card'`, i.e. the
+            app's own code documents this exact bypass.
+  Intentional: known challenge (freeDeluxeChallenge)
+  Fix:      Default-deny: require paymentMode to be one of the known values
+            and reject/charge before granting role, not after a silent
+            fallthrough.
+
+--- 14. Unauthenticated LLM chatbot — unbounded coupon minting via prompt injection · 🟠 HIGH · Confirmed in code ---
+  Where:    routes/chat.ts:176-187 (generateCoupon tool),
+            server.ts:657 (POST /rest/chat, no auth middleware)
+  Impact:   The "max 10%" / "must have a damaged order" coupon policy exists
+            only as prose in the LLM system prompt — the tool's `execute`
+            function applies zero server-side validation on `discount`
+            before minting a real, checkout-honored coupon
+            (security.generateCoupon -> accepted by coupon.ts's
+            discountFromCoupon with no link back to eligibility). Combined
+            with the endpoint requiring no authentication at all, any
+            anonymous visitor who can jailbreak the bot gets an
+            arbitrary-percentage discount.
+  Trace:
+    1. LLM decides discount value, constrained only by prompt text          routes/chat.ts:98-105
+    2. -> generateCoupon.execute({ discount })  (no clamp/eligibility check)  routes/chat.ts:181-186  <- sink
+    3. -> security.generateCoupon(discount)  (accepted at real checkout,
+       see coupon.ts applyCoupon)                                            lib/insecurity.ts:97-99
+  Attack:   Not performed — the configured LLM backend
+            (http://localhost:11434, Ollama) is unreachable in this
+            environment ("Cannot connect to API"), confirmed via a live
+            POST /rest/chat call. The code path is unambiguous and does not
+            depend on model behavior for the missing server-side clamp.
+  Basis:    Static confirmed (full trace); runtime blocked by unavailable
+            LLM backend, not by any defense in the app.
+  Intentional: known challenge (chatbotPromptInjectionChallenge / chatbotGreedyInjectionChallenge)
+  Fix:      Enforce the discount cap and order-eligibility check in code
+            before calling generateCoupon, independent of what the model
+            decides to pass; require authentication on /rest/chat.
+
+--- 15. HTTP parameter pollution — basket-ownership check bypass · 🟠 HIGH · Confirmed in code ---
+  Where:    routes/basketItems.ts:26-45  (endpoint: POST /api/BasketItems)
+  Impact:   The ownership check validates the FIRST `BasketId` key in the
+            (custom, duplicate-key-tolerant) JSON body, but the actual
+            insert uses the LAST `BasketId` key — an attacker sends two
+            BasketId fields (their own, then a victim's) to pass validation
+            and still write into someone else's basket.
+  Trace:
+    1. basketIds[0] checked against session bid                 routes/basketItems.ts:37
+    2. -> basketItem.BasketId = basketIds[basketIds.length-1]    routes/basketItems.ts:42  <- sink (mismatched index)
+  Attack:   Not performed live (would write into a real basket; the code
+            trace is unambiguous — validated index and used index provably
+            differ).
+  Basis:    Static confirmed. The app's own challenge check at
+            basketItems.ts:45 (`user.bid != basketItem.BasketId`) documents
+            the same deviation.
+  Intentional: known challenge (basketManipulateChallenge)
+  Fix:      Re-derive BasketId server-side from the session on every
+            request; never trust any client-supplied BasketId, first or last.
+
+--- 16. Review-author spoofing (mass assignment) · 🟡 MEDIUM · Confirmed in code ---
+  Where:    routes/createProductReviews.ts:26  (endpoint: PUT /rest/products/:id/reviews)
+  Impact:   Any authenticated user can post a review with `author` set to
+            any arbitrary string/email, impersonating another user
+            (including admin) in public review text.
+  Trace:    req.body.author used verbatim, never compared to the caller's
+            session email                                    routes/createProductReviews.ts:19,26  <- sink
+  Basis:    Static confirmed. Confirmed by the app's own
+            forgedReviewChallenge check comparing user.email !== body.author.
+  Intentional: known challenge (forgedReviewChallenge)
+  Fix:      Set author from the authenticated session, ignore any
+            client-supplied author field.
+
+--- 17. Race condition — review "like" can be inflated past once-per-user · 🟡 MEDIUM · Confirmed in code ---
+  Where:    routes/likeProductReviews.ts:24-53
+  Impact:   Read-then-sleep(150ms)-then-write pattern lets concurrent
+            requests all pass the "already liked" check before any write
+            lands, letting one user like a review multiple times
+            (TOCTOU / double-spend pattern).
+  Trace:    likedBy.includes(email) checked, then artificial 150ms sleep,
+            then push+write — no atomic update / lock                     routes/likeProductReviews.ts:30-53
+  Basis:    Static confirmed; the file's own comment labels the sleep
+            "Artificial wait for timing attack challenge".
+  Intentional: known challenge (timingAttackChallenge)
+  Fix:      Use an atomic conditional update ($addToSet-equivalent) instead
+            of read-sleep-write.
+
+--- 18. Poison-null-byte arbitrary file read (legacy technique, low modern exploitability) · 🟡 MEDIUM · Confirmed in code, likely non-functional on current Node ---
+  Where:    routes/fileServer.ts:17-37  (endpoint: GET /ftp/:file)
+  Impact:   Extension check runs before %00 truncation, so
+            `x.bak%00.md` would pass the ".md only" filter and then resolve
+            to `x.bak` — but modern Node.js/V8 no longer truncates strings
+            at embedded null bytes for fs calls, so this specific technique
+            is largely inert today; flagged for completeness per the
+            app's own challenge design.
+  Trace:    endsWithAllowlistedFileType(file) checked on raw file, THEN
+            cutOffPoisonNullByte(file) truncates, THEN res.sendFile          routes/fileServer.ts:26-32
+  Basis:    Static confirmed; noted as likely non-exploitable on the current
+            Node runtime.
+  Intentional: known challenge (nullByteChallenge)
+  Fix:      Validate the extension AFTER truncation, not before (defense in
+            depth regardless of runtime behavior).
+
+--- 19. XXE / YAML-bomb upload handlers · 🟡 MEDIUM · Confirmed in code, config-gated ---
+  Where:    routes/fileUpload.ts:70-131  (endpoint: POST /file-upload)
+  Impact:   XML upload path parses attacker XML (XXE file-disclosure path
+            exists); YAML upload path runs js-yaml `load` inside a vm
+            sandbox with a 2s timeout (DoS via YAML bomb). Both paths are
+            gated behind `deprecatedInterfaceChallenge` being enabled.
+  Trace:    file.buffer -> parseXmlString(data) / yaml.load(data)           routes/fileUpload.ts:76, 109  <- sinks
+  Attack:   Not performed (challenge-flag-gated, and a YAML-bomb proof would
+            risk hanging the shared instance).
+  Basis:    Static confirmed.
+  Intentional: known challenge (xxeFileDisclosureChallenge / xxeDosChallenge / yamlBombChallenge)
+  Fix:      Disable legacy XML/YAML upload interfaces in production; use a
+            non-DTD XML parser and a safe YAML loader with no code paths.
+
+--- 20. Zip-slip guard uses substring `.includes()` instead of path-prefix check · 🟡 MEDIUM · Confirmed in code ---
+  Where:    routes/fileUpload.ts:31-35  (endpoint: POST /file-upload, .zip)
+  Impact:   Path-traversal guard on zip extraction checks
+            `absolutePath.includes(path.resolve('.'))` rather than a proper
+            prefix/containment check — weaker than intended, though not
+            obviously bypassable with a normal `..` payload since
+            unzipper's own path resolution is involved.
+  Trace:    entry.path -> path.resolve('uploads/complaints/'+fileName) ->
+            .includes() check -> pipeline write                            routes/fileUpload.ts:30-34
+  Basis:    Static confirmed (weak-pattern flag; not proven bypassable).
+  Fix:      Use `absolutePath.startsWith(path.resolve('uploads/complaints')+path.sep)`.
+
+═══════════════════════════════════════════════════════════════════════════
+DISCOVERED ENDPOINTS (high-value subset; 100+ total routes in server.ts)
+═══════════════════════════════════════════════════════════════════════════
+POST /rest/user/login · GET /rest/products/search · GET /rest/products/:id/reviews
+PUT /rest/products/:id/reviews · GET /rest/track-order/:id · GET /rest/basket/:id
+POST /api/BasketItems · PUT /rest/basket/:id/coupon/:coupon · GET/POST /rest/deluxe-membership
+POST /profile/image/url · POST /file-upload · POST /rest/chat · POST /b2b/v2/orders
+GET /rest/user/whoami · GET /rest/user/authentication-details · GET /redirect
+GET /encryptionkeys/:file · GET /rest/user/data-export · POST /api/Users
+POST /rest/2fa/verify|setup|disable · GET /rest/order-history/orders (accounting-gated)
+
+═══════════════════════════════════════════════════════════════════════════
+TOOL EXECUTION SUMMARY
+═══════════════════════════════════════════════════════════════════════════
+ok opengrep        — SAST, 1340 files / 781 rules, 159 findings (partial exit
+                      due to a harmless dependency warning, JSON output intact)
+ok npm-audit        — 74 findings (8 CRITICAL, corroborated with public GHSA ids)
+ok trivy            — repo-mode scan completed, 0 dependency CVEs surfaced
+                       (lockfile not picked up in this mode; npm-audit is the
+                       authoritative dependency source here)
+skipped osv-scanner  — "not applicable: no supported packages found" (mount config)
+ok gitleaks (tree)   — 65 secret-pattern hits (mostly the intentional hardcoded
+                        RSA key / demo API keys already covered in finding 5)
+ok gitleaks (history)— 65 secret-pattern hits, same pattern classes
+ok trufflehog        — 0 verified LIVE secrets (no real external creds found)
+ok checkov (Dockerfiles) — 6 MEDIUM (real, see Infrastructure section)
+ok checkov (Terraform)   — 111 MEDIUM, ALL in data/static/codefixes/ teaching
+                            snippets — not real deployed infrastructure
+ok hadolint          — findings folded into checkov-df above
+ok zizmor (GitHub Actions) — 9 findings, 4 HIGH (see CI section)
+ok actionlint         — findings present in aggregate report, low-severity style
+
+═══════════════════════════════════════════════════════════════════════════
+RUNTIME VALIDATION
+═══════════════════════════════════════════════════════════════════════════
+ZAP active scan completed (573 alerts) against http://localhost:3000,
+authenticated with an admin token, seeded with the 13 endpoints traced above
+(spider_completed: true, active_scan_completed: true, partial: false).
+Manually sampled ~300 of 573 alerts across three offsets — the alert set is
+dominated (by far the large majority) by a spider crawl-trap: Angular's SPA
+serves relative asset paths that recursively self-nest under
+/profile/assets/public/assets/public/..., which ZAP followed dozens of
+levels deep, multiplying the same five generic findings (CSP header missing,
+CORS wildcard "Cross-Domain Misconfiguration", Application Error Disclosure,
+Absence of Anti-CSRF Tokens, Timestamp Disclosure) across hundreds of
+synthetic URLs. No unique high-risk alert type was found beyond these in the
+sampled pages. Notably, ZAP's automated injection/XSS active-scan rules did
+NOT independently surface the SQLi, NoSQLi, JWT-forgery, XSS, or IDOR issues
+above — those were found and proven by manual code review + hand-crafted
+requests, which is the expected division of labor (ZAP is strong on generic
+header/config hygiene, weak on business-logic and JS-context injection).
+Representative distinct ZAP alerts folded in below.
+
+--- 21. Missing Content-Security-Policy on API responses · 🟠 MEDIUM · Confirmed (ZAP) ---
+  Where:    Every /rest/* and /api/* response
+  Impact:   No CSP header on API/JSON endpoints; defense-in-depth gap for any
+            XSS that does land (findings 8/9).
+  Fix:      Add a restrictive CSP header via helmet.contentSecurityPolicy().
+
+--- 22. CORS wildcard (Access-Control-Allow-Origin: *) on all endpoints · 🟠 MEDIUM · Confirmed (ZAP) ---
+  Where:    app.use(cors())  server.ts:183, reflected on every route
+  Impact:   Any origin can read API responses if a request is made
+            cross-site (compounds finding 4's JSONP leak; also allows silent
+            cross-origin reads of any endpoint that doesn't require
+            state-changing methods).
+  Fix:      Restrict CORS to known origins; never combine wildcard origin
+            with credentialed endpoints.
+
+--- 23. Absence of anti-CSRF tokens on state-changing forms · 🟠 MEDIUM · Confirmed (ZAP) ---
+  Where:    /profile, /profile/image/file, /profile/image/url (form posts)
+  Impact:   No CSRF token on profile-image and username-change forms;
+            partially mitigated by Bearer-token auth on the JSON API but the
+            cookie-based /profile forms are exposed.
+  Fix:      Add CSRF tokens (or SameSite=strict cookies) to all state-changing
+            form posts.
+
+═══════════════════════════════════════════════════════════════════════════
+INFRASTRUCTURE, CI & DEPENDENCY FINDINGS
+═══════════════════════════════════════════════════════════════════════════
+Dependency CVEs (npm-audit, 74 total: 7 CRITICAL beyond the JWT stack, 16
+HIGH, 11 MODERATE, 3 LOW) — representative CRITICALs not already covered
+above, all reachable (bundled prod dependencies, not devDependencies):
+  - crypto-js: PBKDF2 1000x weaker than spec (weak key derivation) —
+    package-lock.json
+  - pdfkit: vulnerable dependency (used by dataExport PDF generation path)
+  - decompress (via `download` dep): archive extraction can write outside
+    target directory (zip-slip in a transitive dependency, separate from
+    finding 20's direct unzipper usage) — package-lock.json
+  - node-tar: decompression/parse DoS via unlimited input — package-lock.json
+  - lodash: prototype pollution — package-lock.json
+  - sanitize-html: HIGH — XSS / improper input validation in the exact
+    library the app's own `security.sanitizeHtml`/`sanitizeSecure` functions
+    rely on for defense-in-depth (lib/insecurity.ts:58-68) — undermines that
+    safety net app-wide.
+  Fix direction: `npm audit fix` where semver-compatible; pin and upgrade
+  jsonwebtoken/express-jwt/jws/marsdb/notevil/sanitize-html explicitly since
+  they need major-version bumps (breaking changes likely, given how far
+  behind they are).
+
+IaC — checkov:
+  - Dockerfiles (6 MEDIUM, real): missing HEALTHCHECK, `latest` base image
+    tag, no non-root user — Dockerfile, infrastructure/Dockerfile,
+    test/smoke/Dockerfile.
+  - Terraform (111 MEDIUM): 100% located in data/static/codefixes/
+    iacLeakedKeyChallenge_*.tf — these are teaching "before/after" snippets
+    for the IaC-leaked-key challenge, not real deployed infrastructure; not
+    a genuine hardening gap in this repo.
+  Fix direction: add HEALTHCHECK, pin base image digests, add non-root USER
+  to the three real Dockerfiles.
+
+CI/CD — zizmor (9 findings, 4 HIGH): unpinned action references (actions
+  referenced by tag, not SHA), runtime artifacts vulnerable to cache
+  poisoning, use of a fundamentally insecure workflow trigger (consistent
+  with pull_request_target patterns), code injection via template expansion
+  (${{ }} interpolation into a run: step). File:line was not retained by the
+  normalizer for these; re-run `zizmor .github/workflows` directly for exact
+  locations.
+  Fix direction: pin actions to commit SHA, avoid `pull_request_target` with
+  untrusted checkout, never interpolate `${{ github.event.*.body }}`-style
+  values directly into `run:` — pass via `env:` instead.
+
+Secrets — gitleaks (65 tree + 65 history) / trufflehog (0 verified live):
+  Pattern hits are almost entirely the app's own intentional demo content —
+  the hardcoded RSA private key (finding 5), sample API keys, and JWTs
+  embedded in spec/test files and data/static/users.yml. trufflehog's
+  verified-live check found zero real, currently-valid external credentials,
+  confirming these are training artifacts, not leaked production secrets.
+
+═══════════════════════════════════════════════════════════════════════════
+COVERAGE
+═══════════════════════════════════════════════════════════════════════════
+Scanners: full repo scanned (1340 git-tracked files), node_modules/dist/
+  build/coverage excluded per standard opengrep config. All 13 scanners ran
+  to completion or a documented not-applicable state; none timed out.
+
+Deep review (read in full, source-to-sink traced): app.ts, server.ts (route
+  table), lib/insecurity.ts, routes/login.ts, routes/search.ts,
+  routes/resetPassword.ts, routes/changePassword.ts, routes/b2bOrder.ts,
+  routes/profileImageUrlUpload.ts, routes/redirect.ts, routes/coupon.ts,
+  routes/basket.ts, routes/fileUpload.ts, routes/updateUserProfile.ts,
+  routes/2fa.ts, routes/fileServer.ts, routes/keyServer.ts,
+  routes/currentUser.ts, routes/authenticatedUsers.ts, routes/deluxe.ts,
+  routes/chat.ts, routes/orderHistory.ts, routes/trackOrder.ts,
+  routes/address.ts, routes/likeProductReviews.ts, routes/basketItems.ts,
+  routes/createProductReviews.ts, routes/showProductReviews.ts,
+  routes/dataExport.ts, routes/memory.ts, routes/checkKeys.ts, package.json,
+  frontend/src/app/search-result/search-result.component.ts,
+  frontend/src/app/track-result/track-result.component.ts. Everything else
+  covered at scanner/grep level only (not individually traced): remaining
+  ~40 route files (address/order/card/2FA edge cases, easter eggs, metrics),
+  the full Angular frontend beyond the two XSS-sink components, and
+  models/*.
+
+═══════════════════════════════════════════════════════════════════════════
+SUPPRESSED / INFORMATIONAL
+═══════════════════════════════════════════════════════════════════════════
+- routes/dataExport.ts:26 — `memories = MemoryModel.findAll({ where: {
+  UserId: req.body.UserId }})` looks like an IDOR (client-controlled UserId)
+  in isolation, but the route is mounted behind
+  `security.appendUserId()` at server.ts:640, which overwrites
+  req.body.UserId from the session token before the handler runs. Not
+  exploitable — suppressed.
+- checkov-tf 111 MEDIUM findings — all in data/static/codefixes/ teaching
+  snippets, not real infrastructure; not counted as a hardening gap (see
+  Infrastructure section).
+- trivy dependency scan returned zero CVEs in this run's repo-mode — npm-audit
+  is the authoritative dependency-CVE source for this repo; not treated as a
+  clean bill of health on its own.

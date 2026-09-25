@@ -1,0 +1,29 @@
+rules:
+  - id: express-mass-assignment-from-req-body
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >
+      A model is created or updated straight from req.body with no field
+      allowlist. An attacker can supply fields the app never meant to be
+      settable (e.g. role, isAdmin, deletedAt), which is Mass Assignment and a
+      common privilege-escalation path. Bind explicit fields instead: Model.create({ email:
+      req.body.email, password: req.body.password }).
+    metadata:
+      category: security
+      cwe: "CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes"
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+      references:
+        - https://cwe.mitre.org/data/definitions/915.html
+      confidence: HIGH
+    patterns:
+      - pattern-either:
+          - pattern: $M.create($REQ.body)
+          - pattern: $M.create($REQ.body, ...)
+          - pattern: $M.update($REQ.body)
+          - pattern: $M.update($REQ.body, ...)
+          - pattern: $M.build($REQ.body)
+          - pattern: $M.bulkCreate($REQ.body)
+          - pattern: new $M($REQ.body)
+      - metavariable-regex:
+          metavariable: $REQ
+          regex: ^(req|request)$

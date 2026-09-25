@@ -1,0 +1,41 @@
+rules:
+  - id: angular-bypass-security-trust
+    languages: [typescript]
+    severity: ERROR
+    message: >
+      Angular's DomSanitizer.bypassSecurityTrust*() disables the framework's
+      built-in output encoding. If the argument is user-controlled (query param,
+      route data, API response, message body) this is a DOM-based XSS - exactly
+      the class Node/Express SAST rules never see because it lives in the Angular
+      client. Sanitize the value instead of bypassing, or never pass untrusted
+      data here.
+    metadata:
+      category: security
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation (XSS)"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+    pattern-either:
+      - pattern: $S.bypassSecurityTrustHtml(...)
+      - pattern: $S.bypassSecurityTrustScript(...)
+      - pattern: $S.bypassSecurityTrustResourceUrl(...)
+      - pattern: $S.bypassSecurityTrustStyle(...)
+      - pattern: $S.bypassSecurityTrustUrl(...)
+
+  - id: dom-innerhtml-sink-assignment
+    languages: [typescript, javascript]
+    severity: WARNING
+    message: >
+      Assigning to innerHTML (directly or via ElementRef.nativeElement) writes
+      raw markup to the DOM. If the value is not a hardcoded string it is a
+      DOM-XSS sink. Use textContent, Angular binding, or a sanitizer.
+    metadata:
+      category: security
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation (XSS)"
+      owasp: "A03:2021 - Injection"
+      confidence: LOW
+    patterns:
+      - pattern-either:
+          - pattern: $EL.nativeElement.innerHTML = $X
+          - pattern: $EL.innerHTML = $X
+      - pattern-not: $EL.nativeElement.innerHTML = "..."
+      - pattern-not: $EL.innerHTML = "..."

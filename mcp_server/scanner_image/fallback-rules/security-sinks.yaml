@@ -1,0 +1,9 @@
+rules:
+  - id: cerberus-parser-fallback-dangerous-sink
+    languages: [generic]
+    severity: WARNING
+    message: >-
+      Parser-independent review lead in a file with incomplete AST analysis.
+      Trace input, authorization and sanitization before confirming a vulnerability.
+      This text match does not restore full SAST coverage.
+    pattern-regex: '\b(eval\s*\(|runIn(?:New)?Context\s*\(|execSync\s*\(|sequelize\.query\s*\(|bypassSecurityTrustHtml\s*\(|dangerouslySetInnerHTML\b)|\$where\s*:'

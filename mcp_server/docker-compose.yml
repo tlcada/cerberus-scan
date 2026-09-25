@@ -1,0 +1,25 @@
+name: cerberus-scan
+
+# ZAP daemon for active runtime validation. The MCP server brings this up only
+# when a scan requests ZAP validation. The scanner itself does not use compose —
+# the server builds and runs it directly. ZAP needs to reach a target on the
+# host, so it maps host.docker.internal.
+
+services:
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    profiles: ["validate"]
+    ports:
+      - "8282:8282"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >-
+      zap.sh -daemon -port 8282 -host 0.0.0.0
+      -config api.disablekey=true
+      -config api.addrs.addr.name=.*
+      -config api.addrs.addr.regex=true
+    volumes:
+      - zap-data:/home/zap/.ZAP
+
+volumes:
+  zap-data:
